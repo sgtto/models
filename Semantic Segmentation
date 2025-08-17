@@ -1,0 +1,309 @@
+import os
+import numpy as np
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import segmentation_models_pytorch as smp
+from tqdm import tqdm  # 进度条库
+from sklearn.manifold import TSNE
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 中文黑体
+plt.rcParams['axes.unicode_minus'] = False    # 正常显示负号
+# ===== 类别映射表 =====
+CLASS_NAMES = {
+    0: "背景", 1: "肿瘤", 2: "基质", 3: "淋巴浸润", 4: "坏死或碎片", 5: "腺体分泌物",
+    6: "血液", 7: "排除", 8: "化生", 9: "脂肪", 10: "血浆细胞", 11: "其他免疫浸润",
+    12: "粘液性物质", 13: "正常腺泡或导管", 14: "淋巴管", 15: "未确定", 16: "神经",
+    17: "皮肤附属物", 18: "血管", 19: "血管侵袭", 20: "导管原位癌（DCIS）", 21: "其他"
+}
+
+# ===== 类别颜色（RGB） =====
+CLASS_COLORS = {
+    0: (0, 0, 0), 1: (255, 0, 0), 2: (0, 255, 0), 3: (0, 0, 255), 4: (255, 255, 0),
+    5: (255, 165, 0), 6: (139, 0, 0), 7: (128, 128, 128), 8: (255, 0, 255),
+    9: (255, 192, 203), 10: (0, 255, 255), 11: (173, 216, 230), 12: (144, 238, 144),
+    13: (160, 82, 45), 14: (75, 0, 130), 15: (255, 20, 147), 16: (210, 180, 140),
+    17: (70, 130, 180), 18: (0, 128, 128), 19: (139, 69, 19), 20: (128, 0, 128),
+    21: (255, 255, 255)
+}
+
+# ===== 指标函数 =====
+def pixel_accuracy(pred, target):
+    pred = torch.argmax(pred, dim=1)
+    correct = (pred == target).float()
+    return correct.sum() / correct.numel()
+
+def mean_iou(pred, target, num_classes):
+    pred = torch.argmax(pred, dim=1)
+    ious = []
+    for cls in range(1, num_classes):
+        pred_cls = (pred == cls)
+        target_cls = (target == cls)
+        inter = (pred_cls & target_cls).sum().item()
+        union = (pred_cls | target_cls).sum().item()
+        if union > 0:
+            ious.append(inter / union)
+    return sum(ious) / len(ious) if ious else 0
+
+def dice_score(pred, target, num_classes, smooth=1e-5):
+    pred = torch.argmax(pred, dim=1)
+    dice_total = 0
+    for cls in range(1, num_classes):
+        pred_cls = (pred == cls).float()
+        target_cls = (target == cls).float()
+        inter = (pred_cls * target_cls).sum()
+        union = pred_cls.sum() + target_cls.sum()
+        dice_total += (2 * inter + smooth) / (union + smooth)
+    return dice_total / (num_classes - 1)
+
+def compute_confusion_matrix(pred, target, num_classes):
+    pred = torch.argmax(pred, dim=1).view(-1).cpu().numpy()
+    target = target.view(-1).cpu().numpy()
+    return confusion_matrix(target, pred, labels=list(range(num_classes)))
+
+def plot_confusion_matrix(cm, class_names, included_names, save_path='confusion_matrix.png'):
+    idx = [i for i in included_names]
+    cm = cm[np.ix_(idx, idx)]
+    labels = [class_names[i] for i in idx]
+    cm = cm.astype(np.float64)
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm = np.divide(cm, row_sums, out=np.zeros_like(cm), where=row_sums != 0) * 100
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues',
+                xticklabels=labels, yticklabels=labels)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.title("Confusion Matrix (%)")
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+# ===== 数据集类 =====
+class BreastCancerSegDataset(Dataset):
+    def __init__(self, img_dir, mask_dir, transform=None):
+        self.img_dir = img_dir
+        self.mask_dir = mask_dir
+        self.transform = transform
+        self.img_files = sorted([f for f in os.listdir(img_dir) if f.endswith((".png", ".jpg"))])
+        self.mask_files = sorted([f for f in os.listdir(mask_dir) if f.endswith((".png", ".jpg"))])
+        assert len(self.img_files) == len(self.mask_files), "图片与掩码数量不一致！"
+
+    def __len__(self):
+        return len(self.img_files)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.img_dir, self.img_files[idx])
+        mask_path = os.path.join(self.mask_dir, self.mask_files[idx])
+        image = np.array(Image.open(img_path).convert("RGB"), dtype=np.float32) / 255.0
+        mask = np.array(Image.open(mask_path).convert("L"), dtype=np.uint8)
+
+        if self.transform:
+            transformed = self.transform(image=image, mask=mask)
+            image, mask = transformed["image"], transformed["mask"]
+
+        image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1)
+        mask = torch.tensor(mask, dtype=torch.long)
+        return image, mask, self.img_files[idx]
+
+# ===== 灰度掩码 → 彩色掩码 =====
+def decode_segmap(mask):
+    h, w = mask.shape
+    color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+    for cls_id, color in CLASS_COLORS.items():
+        color_mask[mask == cls_id] = color
+    return color_mask
+
+def save_predictions(model, dataloader, device, save_dir="pred_masks"):
+    os.makedirs(save_dir, exist_ok=True)
+    model.eval()
+    with torch.no_grad():
+        # 已有的进度条（保持不变）
+        for images, masks, filenames in tqdm(dataloader, desc="保存预测彩色掩码"):
+            images = images.to(device)
+            outputs = model(images)
+            preds = torch.argmax(outputs, dim=1).cpu().numpy()
+            for pred, fname in zip(preds, filenames):
+                base_name = os.path.splitext(fname)[0]
+                color_mask = decode_segmap(pred)
+                Image.fromarray(color_mask).save(os.path.join(save_dir, f"{base_name}_color.png"))
+
+# ===== t-SNE 可视化 =====
+def visualize_tsne(model, dataloader, device, save_path='tsne.png'):
+    model.eval()
+    features, labels = [], []
+    with torch.no_grad():
+        # 添加进度条：显示特征提取进度
+        for images, masks, _ in tqdm(dataloader, desc="提取特征用于t-SNE"):
+            images, masks = images.to(device), masks.to(device)
+            feats = model.encoder(images)
+            if isinstance(feats, list):
+                feats = feats[-1]
+            pooled = torch.nn.functional.adaptive_avg_pool2d(feats, (1,1)).squeeze()
+            features.append(pooled.cpu())
+            labels.append(masks.view(masks.size(0), -1).max(dim=1)[0].cpu())
+    features = torch.cat(features, dim=0)
+    labels = torch.cat(labels, dim=0)
+    # t-SNE计算可能耗时，添加进度提示（tqdm无直接支持，用print代替）
+    print("正在进行t-SNE降维...")
+    tsne_result = TSNE(n_components=2, perplexity=30, init='pca', random_state=42).fit_transform(features.numpy())
+    print("t-SNE降维完成，正在绘制图像...")
+    unique_labels = torch.unique(labels)
+    class_colors = plt.cm.get_cmap('tab10', len(unique_labels))
+    plt.figure(figsize=(8, 6))
+    for i, class_label in enumerate(unique_labels):
+        idxs = (labels == class_label).numpy()
+        plt.scatter(tsne_result[idxs,0], tsne_result[idxs,1], c=[class_colors(i)], label=f'{CLASS_NAMES[int(class_label)]}', alpha=0.6)
+    plt.legend()
+    plt.title("t-SNE of Feature Embeddings")
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+# ===== 训练函数 =====
+def train_model(model, train_loader, device, num_classes, epochs=10, lr=1e-3):
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    best_train_dice = 0
+    best_model_path = 'best_model.pth'
+
+    # 外层epoch进度条
+    for epoch in range(epochs):
+        model.train()
+        total_loss, total_dice, total_PA, total_IoU = 0,0,0,0
+        # 内层batch进度条，添加描述信息（当前epoch）
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} 训练中")
+        for images, masks,_ in train_pbar:
+            images, masks = images.to(device), masks.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+            loss.backward()
+            optimizer.step()
+            
+            # 累加指标
+            total_loss += loss.item() * images.size(0)
+            batch_dice = dice_score(outputs, masks, num_classes).item()
+            batch_pa = pixel_accuracy(outputs, masks).item()
+            batch_iou = mean_iou(outputs, masks, num_classes)
+            total_dice += batch_dice * images.size(0)
+            total_PA += batch_pa * images.size(0)
+            total_IoU += batch_iou * images.size(0)
+            
+            # 在进度条上实时显示当前batch的指标
+            train_pbar.set_postfix({
+                "batch_loss": f"{loss.item():.4f}",
+                "batch_dice": f"{batch_dice:.4f}",
+                "batch_pa": f"{batch_pa:.4f}"
+            })
+
+        # 计算epoch平均指标
+        avg_loss = total_loss / len(train_loader.dataset)
+        avg_dice = total_dice / len(train_loader.dataset)
+        avg_pa = total_PA / len(train_loader.dataset)
+        avg_iou = total_IoU / len(train_loader.dataset)
+        print(f"\nEpoch {epoch+1} 总结: "
+              f"Train Loss={avg_loss:.4f}, "
+              f"Train PA={avg_pa:.4f}, "
+              f"Train IoU={avg_iou:.4f}, "
+              f"Train Dice={avg_dice:.4f}")
+
+        # 保存最佳模型（修正变量名错误）
+        if avg_dice > best_train_dice:
+            best_train_dice = avg_dice
+            torch.save(model.state_dict(), best_model_path)
+            print(f"保存最佳模型至 {best_model_path} (Train Dice: {best_train_dice:.4f})")
+
+    return model
+
+def test(model, val_loader, device, num_classes):
+    val_loss, val_dice, val_PA, val_IoU = 0,0,0,0
+    all_preds, all_targets = [], []
+    model.eval()
+    criterion = nn.CrossEntropyLoss()  # 新增：定义损失函数
+    # 添加测试进度条
+    val_pbar = tqdm(val_loader, desc="测试中")
+    with torch.no_grad():
+        for images, masks,_ in val_pbar:
+            images, masks = images.to(device), masks.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+            
+            # 累加指标
+            val_loss += loss.item() * images.size(0)
+            batch_dice = dice_score(outputs, masks, num_classes).item()
+            batch_pa = pixel_accuracy(outputs, masks).item()
+            batch_iou = mean_iou(outputs, masks, num_classes)
+            val_dice += batch_dice * images.size(0)
+            val_PA += batch_pa * images.size(0)
+            val_IoU += batch_iou * images.size(0)
+            
+            # 进度条实时显示
+            val_pbar.set_postfix({
+                "batch_loss": f"{loss.item():.4f}",
+                "batch_dice": f"{batch_dice:.4f}"
+            })
+            
+            all_preds.append(outputs.cpu())
+            all_targets.append(masks.cpu())
+
+    # 计算平均指标
+    avg_val_loss = val_loss / len(val_loader.dataset)
+    avg_val_dice = val_dice / len(val_loader.dataset)
+    avg_val_PA = val_PA / len(val_loader.dataset)
+    avg_val_IoU = val_IoU / len(val_loader.dataset)
+    print(f"\n测试集总结: "
+          f"Val Loss={avg_val_loss:.4f}, "
+          f"Val Dice={avg_val_dice:.4f}, "
+          f"Val PA={avg_val_PA:.4f}, "
+          f"Val IoU={avg_val_IoU:.4f}")
+    
+    # 生成混淆矩阵（修正变量错误）
+    all_preds_tensor = torch.cat(all_preds, dim=0)
+    all_targets_tensor = torch.cat(all_targets, dim=0)
+    cm = compute_confusion_matrix(all_preds_tensor, all_targets_tensor, num_classes)
+    included_names = [0,2,3] 
+    plot_confusion_matrix(cm, CLASS_NAMES, included_names, save_path='confusion_matrix.png')
+
+# ===== 主程序 =====
+if __name__ == "__main__":
+    print("开始执行程序...")
+    # 数据路径
+    img_dir_train = "/kaggle/input/breast-cancer-semantic-segmentation-bcss/BCSS_512/train_512"
+    mask_dir_train = "/kaggle/input/breast-cancer-semantic-segmentation-bcss/BCSS_512/train_mask_512"
+    img_dir_val = "/kaggle/input/breast-cancer-semantic-segmentation-bcss/BCSS_512/val_512"
+    mask_dir_val = "/kaggle/input/breast-cancer-semantic-segmentation-bcss/BCSS_512/val_mask_512"
+
+    # 数据集
+    train_dataset = BreastCancerSegDataset(img_dir_train, mask_dir_train)
+    val_dataset = BreastCancerSegDataset(img_dir_val, mask_dir_val)
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
+
+    # 模型
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_classes = len(CLASS_NAMES)
+    model = smp.Unet(
+        encoder_name="resnet34",
+        encoder_weights="imagenet",
+        in_channels=3,
+        classes=num_classes
+    ).to(device)
+    print(f"使用设备: {device}")
+
+    # 训练
+    model = train_model(model, train_loader, device, num_classes, epochs=10, lr=1e-4)
+    # 测试
+    test(model, val_loader, device, num_classes)
+    # t-SNE 可视化
+    visualize_tsne(model, val_loader, device)
+
+    # 保存验证集预测结果
+    save_predictions(model, val_loader, device, save_dir="val_pred_masks")
+    print("验证集预测彩色掩码已保存到 val_pred_masks 文件夹")
+    print("程序执行完毕")
